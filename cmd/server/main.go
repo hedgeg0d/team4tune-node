@@ -46,7 +46,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	mux.Handle("/ws", wsapi.New(reg, pipeline))
-	mux.Handle("/media/", http.StripPrefix("/media/", http.FileServer(http.Dir(pipeline.CacheDir()))))
+	mux.HandleFunc("/media/", pipeline.ServeMedia)
 	mux.Handle("/upload", httpapi.Upload(pipeline))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

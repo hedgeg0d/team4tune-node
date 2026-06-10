@@ -1,6 +1,7 @@
 package media
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -29,8 +30,9 @@ type Pipeline struct {
 	cacheDir string
 	baseURL  string
 
-	mu     sync.Mutex
-	tracks map[string]*protocol.Track
+	mu      sync.Mutex
+	tracks  map[string]*protocol.Track
+	streams map[string]*mediaStream
 }
 
 func New(cacheDir, baseURL string) (*Pipeline, error) {
@@ -41,6 +43,7 @@ func New(cacheDir, baseURL string) (*Pipeline, error) {
 		cacheDir: cacheDir,
 		baseURL:  strings.TrimRight(baseURL, "/"),
 		tracks:   make(map[string]*protocol.Track),
+		streams:  make(map[string]*mediaStream),
 	}, nil
 }
 
@@ -171,37 +174,137 @@ func (p *Pipeline) update(id string, fn func(t *protocol.Track), onUpdate func(p
 
 func (p *Pipeline) run(id, sourceURL string, onUpdate func(protocol.Track)) {
 	out := filepath.Join(p.cacheDir, id+".opus")
+	fileURL := p.baseURL + "/media/" + id + ".opus"
 
-	if title, ok := probeTitle(sourceURL); ok {
+	title, durMs := probeMeta(sourceURL)
+	if title != "" {
 		p.update(id, func(t *protocol.Track) { t.Title = title }, onUpdate)
 	}
 
-	if _, err := os.Stat(out); err != nil {
-		tmpl := filepath.Join(p.cacheDir, id+".%(ext)s")
-		cmd := exec.Command("yt-dlp",
-			"-x", "--audio-format", "opus",
-			"--no-playlist",
-			"--no-progress",
-			"-o", tmpl,
-			sourceURL,
-		)
-		if err := cmd.Run(); err != nil {
-			p.update(id, func(t *protocol.Track) { t.Status = StatusError }, onUpdate)
-			return
+	if _, err := os.Stat(out); err == nil {
+		if durMs == 0 {
+			durMs = probeDurationMs(out)
 		}
-		if !p.exists(id) {
-			_ = p.Delete(id)
-			return
-		}
+		p.markReady(id, fileURL, durMs, onUpdate)
+		return
 	}
 
-	dur := probeDurationMs(out)
-	fileURL := p.baseURL + "/media/" + id + ".opus"
+	st := newMediaStream()
+	p.mu.Lock()
+	p.streams[id] = st
+	p.mu.Unlock()
+	defer func() {
+		p.mu.Lock()
+		delete(p.streams, id)
+		p.mu.Unlock()
+	}()
+
+	part := filepath.Join(p.cacheDir, id+".part")
+	_ = os.Remove(part)
+	pf, err := os.Create(part)
+	if err != nil {
+		st.fail()
+		p.setError(id, onUpdate)
+		return
+	}
+
+	ytdlp := exec.Command("yt-dlp",
+		"-f", "bestaudio/best",
+		"--no-playlist", "--no-progress",
+		"-o", "-", sourceURL,
+	)
+	ff := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-i", "pipe:0",
+		"-vn", "-c:a", "libopus", "-b:a", audioBitrate,
+		"-f", "ogg", "pipe:1",
+	)
+	ytOut, err := ytdlp.StdoutPipe()
+	if err != nil {
+		pf.Close()
+		st.fail()
+		p.setError(id, onUpdate)
+		return
+	}
+	ff.Stdin = ytOut
+	ffOut, err := ff.StdoutPipe()
+	if err != nil {
+		pf.Close()
+		st.fail()
+		p.setError(id, onUpdate)
+		return
+	}
+	if err := ytdlp.Start(); err != nil || ff.Start() != nil {
+		pf.Close()
+		st.fail()
+		_ = os.Remove(part)
+		p.setError(id, onUpdate)
+		return
+	}
+
+	var total int64
+	var copyErr error
+	readyMarked := false
+	buf := make([]byte, tailChunkBytes)
+	for {
+		n, er := ffOut.Read(buf)
+		if n > 0 {
+			if _, we := pf.Write(buf[:n]); we != nil {
+				copyErr = we
+				break
+			}
+			total += int64(n)
+			st.advance(int64(n))
+			if !readyMarked && durMs > 0 && total >= headBufferBytes {
+				readyMarked = true
+				p.markReady(id, fileURL, durMs, onUpdate)
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				copyErr = er
+			}
+			break
+		}
+	}
+	pf.Close()
+	ffErr := ff.Wait()
+	_ = ytdlp.Wait()
+
+	if copyErr != nil || ffErr != nil || total == 0 {
+		st.fail()
+		_ = os.Remove(part)
+		p.setError(id, onUpdate)
+		return
+	}
+	if !p.exists(id) {
+		st.fail()
+		_ = os.Remove(part)
+		_ = p.Delete(id)
+		return
+	}
+	if err := os.Rename(part, out); err != nil {
+		st.fail()
+		p.setError(id, onUpdate)
+		return
+	}
+	st.finish(total)
+	if durMs == 0 {
+		durMs = probeDurationMs(out)
+	}
+	p.markReady(id, fileURL, durMs, onUpdate)
+}
+
+func (p *Pipeline) markReady(id, fileURL string, durMs int64, onUpdate func(protocol.Track)) {
 	p.update(id, func(t *protocol.Track) {
 		t.Status = StatusReady
 		t.FileURL = fileURL
-		t.DurationMs = dur
+		t.DurationMs = durMs
 	}, onUpdate)
+}
+
+func (p *Pipeline) setError(id string, onUpdate func(protocol.Track)) {
+	p.update(id, func(t *protocol.Track) { t.Status = StatusError }, onUpdate)
 }
 
 func trackID(sourceURL string) string {
@@ -209,17 +312,26 @@ func trackID(sourceURL string) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-func probeTitle(sourceURL string) (string, bool) {
-	cmd := exec.Command("yt-dlp", "--no-playlist", "--skip-download", "--print", "%(title)s", sourceURL)
+func probeMeta(sourceURL string) (title string, durationMs int64) {
+	cmd := exec.Command("yt-dlp", "--no-playlist", "--skip-download",
+		"--print", "%(title)s", "--print", "%(duration)s", sourceURL)
 	out, err := cmd.Output()
 	if err != nil {
-		return "", false
+		return "", 0
 	}
-	title := strings.TrimSpace(string(out))
-	if title == "" || title == "NA" {
-		return "", false
+	sc := bufio.NewScanner(strings.NewReader(string(out)))
+	if sc.Scan() {
+		t := strings.TrimSpace(sc.Text())
+		if t != "" && t != "NA" {
+			title = t
+		}
 	}
-	return title, true
+	if sc.Scan() {
+		if sec, err := strconv.ParseFloat(strings.TrimSpace(sc.Text()), 64); err == nil {
+			durationMs = int64(sec * 1000)
+		}
+	}
+	return title, durationMs
 }
 
 func probeIsOpus(path string) bool {

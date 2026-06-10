@@ -31,7 +31,7 @@ func TestEnqueueEndToEnd(t *testing.T) {
 	}
 	mux := http.NewServeMux()
 	mux.Handle("/ws", New(room.NewRegistry(), pipeline))
-	mux.Handle("/media/", http.StripPrefix("/media/", http.FileServer(http.Dir(pipeline.CacheDir()))))
+	mux.HandleFunc("/media/", pipeline.ServeMedia)
 	srv := httptest.NewServer(mux)
 	defer srv.Close()
 
