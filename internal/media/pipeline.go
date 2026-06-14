@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/team4tune/node-server/internal/protocol"
 )
@@ -52,7 +53,11 @@ func (p *Pipeline) CacheDir() string { return p.cacheDir }
 func (p *Pipeline) Delete(id string) error {
 	p.mu.Lock()
 	delete(p.tracks, id)
+	st := p.streams[id]
 	p.mu.Unlock()
+	if st != nil {
+		st.abort()
+	}
 	paths, err := filepath.Glob(filepath.Join(p.cacheDir, id+".*"))
 	if err != nil {
 		return err
@@ -242,11 +247,37 @@ func (p *Pipeline) run(id, sourceURL string, onUpdate func(protocol.Track)) {
 		return
 	}
 
-	var total int64
+	go func() {
+		<-st.abortCh
+		if ytdlp.Process != nil {
+			_ = ytdlp.Process.Kill()
+		}
+		if ff.Process != nil {
+			_ = ff.Process.Kill()
+		}
+	}()
+
+	var total, lastPunch int64
 	var copyErr error
 	readyMarked := false
+	windowed := false
 	buf := make([]byte, tailChunkBytes)
 	for {
+		if windowed {
+			for {
+				_, observed, aborted := st.frontier()
+				if aborted || total-observed < windowAheadBytes {
+					break
+				}
+				select {
+				case <-st.abortCh:
+				case <-time.After(tailPollInterval):
+				}
+			}
+		}
+		if _, _, aborted := st.frontier(); aborted {
+			break
+		}
 		n, er := ffOut.Read(buf)
 		if n > 0 {
 			if _, we := pf.Write(buf[:n]); we != nil {
@@ -255,6 +286,16 @@ func (p *Pipeline) run(id, sourceURL string, onUpdate func(protocol.Track)) {
 			}
 			total += int64(n)
 			st.advance(int64(n))
+			if !windowed && total >= windowEngageBytes {
+				windowed = true
+			}
+			if windowed {
+				_, observed, _ := st.frontier()
+				if off, length, ok := nextPunch(observed, lastPunch); ok {
+					_ = punchHole(pf, off, length)
+					lastPunch = off + length
+				}
+			}
 			if !readyMarked && durMs > 0 && total >= headBufferBytes {
 				readyMarked = true
 				p.markReady(id, fileURL, durMs, onUpdate)
@@ -271,6 +312,11 @@ func (p *Pipeline) run(id, sourceURL string, onUpdate func(protocol.Track)) {
 	ffErr := ff.Wait()
 	_ = ytdlp.Wait()
 
+	if _, _, aborted := st.frontier(); aborted {
+		st.fail()
+		_ = os.Remove(part)
+		return
+	}
 	if copyErr != nil || ffErr != nil || total == 0 {
 		st.fail()
 		_ = os.Remove(part)

@@ -61,71 +61,33 @@ func TestServeMediaCompletedFile(t *testing.T) {
 	}
 }
 
-func TestServeMediaInProgressRange(t *testing.T) {
+func TestServeMediaLiveStreamFromStart(t *testing.T) {
 	p := newTestPipeline(t)
 	id := "live1"
-	registerPart(t, p, id, []byte("0123456789"))
+	st := registerPart(t, p, id, []byte("0123456789"))
+	st.finish(10)
 
-	resp := doGet(t, p, id, "bytes=2-5")
-	if resp.StatusCode != http.StatusPartialContent {
-		t.Fatalf("status = %d, want 206", resp.StatusCode)
+	resp := doGet(t, p, id, "bytes=0-")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
 	}
-	if cr := resp.Header.Get("Content-Range"); cr != "bytes 2-5/*" {
-		t.Fatalf("Content-Range = %q, want %q", cr, "bytes 2-5/*")
+	if resp.Header.Get("Accept-Ranges") != "" {
+		t.Fatal("in-progress stream must not advertise Accept-Ranges")
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "2345" {
-		t.Fatalf("body = %q, want %q", body, "2345")
+	if string(body) != "0123456789" {
+		t.Fatalf("body = %q, want %q", body, "0123456789")
 	}
 }
 
-func TestServeMediaOpenRangeServesAvailable(t *testing.T) {
+func TestServeMediaRejectsSeekWhileStreaming(t *testing.T) {
 	p := newTestPipeline(t)
 	id := "live2"
 	registerPart(t, p, id, []byte("abcdef"))
 
 	resp := doGet(t, p, id, "bytes=2-")
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "cdef" {
-		t.Fatalf("body = %q, want %q", body, "cdef")
-	}
-	if cl := resp.Header.Get("Content-Length"); cl != "4" {
-		t.Fatalf("Content-Length = %q, want 4", cl)
-	}
-}
-
-func TestServeMediaWaitsForBytesThenFinishes(t *testing.T) {
-	p := newTestPipeline(t)
-	id := "live3"
-	part := filepath.Join(p.cacheDir, id+".part")
-	if err := os.WriteFile(part, []byte("AAAA"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	st := newMediaStream()
-	st.advance(4)
-	p.mu.Lock()
-	p.streams[id] = st
-	p.mu.Unlock()
-
-	go func() {
-		time.Sleep(60 * time.Millisecond)
-		f, _ := os.OpenFile(part, os.O_APPEND|os.O_WRONLY, 0o644)
-		f.Write([]byte("BBBB"))
-		f.Close()
-		st.advance(4)
-		st.finish(8)
-	}()
-
-	resp := doGet(t, p, id, "bytes=6-")
-	if resp.StatusCode != http.StatusPartialContent {
-		t.Fatalf("status = %d, want 206", resp.StatusCode)
-	}
-	if cr := resp.Header.Get("Content-Range"); cr != "bytes 6-7/8" {
-		t.Fatalf("Content-Range = %q, want %q", cr, "bytes 6-7/8")
-	}
-	body, _ := io.ReadAll(resp.Body)
-	if string(body) != "BB" {
-		t.Fatalf("body = %q, want %q", body, "BB")
+	if resp.StatusCode != http.StatusRequestedRangeNotSatisfiable {
+		t.Fatalf("status = %d, want 416", resp.StatusCode)
 	}
 }
 

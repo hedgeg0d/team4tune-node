@@ -18,21 +18,40 @@ const (
 	tailChunkBytes   = 64 << 10
 )
 
+var (
+	windowEngageBytes int64 = 8 << 20
+	windowAheadBytes  int64 = 2 << 20
+	windowBackBytes   int64 = 2 << 20
+	windowHeaderKeep  int64 = 128 << 10
+	windowPunchMin    int64 = 1 << 20
+)
+
 type mediaStream struct {
-	mu      sync.Mutex
-	written int64
-	total   int64
-	done    bool
-	failed  bool
+	mu       sync.Mutex
+	written  int64
+	observed int64
+	total    int64
+	done     bool
+	failed   bool
+	aborted  bool
+	abortCh  chan struct{}
 }
 
 func newMediaStream() *mediaStream {
-	return &mediaStream{}
+	return &mediaStream{abortCh: make(chan struct{})}
 }
 
 func (s *mediaStream) advance(n int64) {
 	s.mu.Lock()
 	s.written += n
+	s.mu.Unlock()
+}
+
+func (s *mediaStream) observe(off int64) {
+	s.mu.Lock()
+	if off > s.observed {
+		s.observed = off
+	}
 	s.mu.Unlock()
 }
 
@@ -51,10 +70,25 @@ func (s *mediaStream) fail() {
 	s.mu.Unlock()
 }
 
+func (s *mediaStream) abort() {
+	s.mu.Lock()
+	if !s.aborted {
+		s.aborted = true
+		close(s.abortCh)
+	}
+	s.mu.Unlock()
+}
+
 func (s *mediaStream) snap() (written int64, done, failed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.written, s.done, s.failed
+}
+
+func (s *mediaStream) frontier() (written, observed int64, aborted bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.written, s.observed, s.aborted
 }
 
 func (p *Pipeline) ServeMedia(w http.ResponseWriter, r *http.Request) {
@@ -65,26 +99,27 @@ func (p *Pipeline) ServeMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	final := filepath.Join(p.cacheDir, id+".opus")
-	if fi, err := os.Stat(final); err == nil {
-		f, err := os.Open(final)
-		if err != nil {
-			http.Error(w, "", http.StatusInternalServerError)
-			return
-		}
-		defer f.Close()
-		http.ServeContent(w, r, id+".opus", fi.ModTime(), f)
-		return
-	}
-
 	p.mu.Lock()
 	st := p.streams[id]
 	p.mu.Unlock()
-	if st == nil {
+	if st != nil {
+		p.serveStream(w, r, id, st)
+		return
+	}
+
+	final := filepath.Join(p.cacheDir, id+".opus")
+	fi, err := os.Stat(final)
+	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	p.serveStream(w, r, id, st)
+	f, err := os.Open(final)
+	if err != nil {
+		http.Error(w, "", http.StatusInternalServerError)
+		return
+	}
+	defer f.Close()
+	http.ServeContent(w, r, id+".opus", fi.ModTime(), f)
 }
 
 func (p *Pipeline) serveStream(w http.ResponseWriter, r *http.Request, id string, st *mediaStream) {
@@ -104,48 +139,14 @@ func (p *Pipeline) serveStream(w http.ResponseWriter, r *http.Request, id string
 	defer f.Close()
 
 	w.Header().Set("Content-Type", "audio/ogg")
-	w.Header().Set("Accept-Ranges", "bytes")
 
-	start, end, hasRange, ok := parseRange(r.Header.Get("Range"))
-	if !ok {
+	start, _, _, ok := parseRange(r.Header.Get("Range"))
+	if !ok || start != 0 {
 		http.Error(w, "", http.StatusRequestedRangeNotSatisfiable)
 		return
 	}
-	if !hasRange {
-		w.WriteHeader(http.StatusOK)
-		p.tailCopy(r, w, f, st)
-		return
-	}
-
-	avail, done, failed := p.waitAvail(r, st, start)
-	if failed {
-		http.Error(w, "", http.StatusInternalServerError)
-		return
-	}
-	if r.Context().Err() != nil {
-		return
-	}
-	if start >= avail {
-		w.Header().Set("Content-Range", "bytes */"+strconv.FormatInt(avail, 10))
-		http.Error(w, "", http.StatusRequestedRangeNotSatisfiable)
-		return
-	}
-	last := avail - 1
-	if end >= 0 && end < last {
-		last = end
-	}
-	length := last - start + 1
-	total := "*"
-	if done {
-		total = strconv.FormatInt(avail, 10)
-	}
-	w.Header().Set("Content-Range", "bytes "+strconv.FormatInt(start, 10)+"-"+strconv.FormatInt(last, 10)+"/"+total)
-	w.Header().Set("Content-Length", strconv.FormatInt(length, 10))
-	w.WriteHeader(http.StatusPartialContent)
-	if r.Method == http.MethodHead {
-		return
-	}
-	_, _ = io.Copy(w, io.NewSectionReader(f, start, length))
+	w.WriteHeader(http.StatusOK)
+	p.tailCopy(r, w, f, st)
 }
 
 func (p *Pipeline) tailCopy(r *http.Request, w http.ResponseWriter, f *os.File, st *mediaStream) {
@@ -164,6 +165,7 @@ func (p *Pipeline) tailCopy(r *http.Request, w http.ResponseWriter, f *os.File, 
 					return
 				}
 				off += int64(n)
+				st.observe(off)
 			}
 			if err != nil && err != io.EOF {
 				return
@@ -232,4 +234,19 @@ func parseRange(h string) (start, end int64, hasRange, ok bool) {
 		}
 	}
 	return s, e, true, true
+}
+
+func nextPunch(observed, lastPunch int64) (off, length int64, ok bool) {
+	punchTo := observed - windowBackBytes
+	if punchTo <= windowHeaderKeep {
+		return 0, 0, false
+	}
+	from := lastPunch
+	if from < windowHeaderKeep {
+		from = windowHeaderKeep
+	}
+	if punchTo-from < windowPunchMin {
+		return 0, 0, false
+	}
+	return from, punchTo - from, true
 }
