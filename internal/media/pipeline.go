@@ -31,9 +31,10 @@ type Pipeline struct {
 	cacheDir string
 	baseURL  string
 
-	mu      sync.Mutex
-	tracks  map[string]*protocol.Track
-	streams map[string]*mediaStream
+	mu         sync.Mutex
+	tracks     map[string]*protocol.Track
+	streams    map[string]*mediaStream
+	directURLs map[string]string
 }
 
 func New(cacheDir, baseURL string) (*Pipeline, error) {
@@ -41,10 +42,11 @@ func New(cacheDir, baseURL string) (*Pipeline, error) {
 		return nil, err
 	}
 	return &Pipeline{
-		cacheDir: cacheDir,
-		baseURL:  strings.TrimRight(baseURL, "/"),
-		tracks:   make(map[string]*protocol.Track),
-		streams:  make(map[string]*mediaStream),
+		cacheDir:   cacheDir,
+		baseURL:    strings.TrimRight(baseURL, "/"),
+		tracks:     make(map[string]*protocol.Track),
+		streams:    make(map[string]*mediaStream),
+		directURLs: make(map[string]string),
 	}, nil
 }
 
@@ -53,12 +55,18 @@ func (p *Pipeline) CacheDir() string { return p.cacheDir }
 func (p *Pipeline) Delete(id string) error {
 	p.mu.Lock()
 	delete(p.tracks, id)
-	st := p.streams[id]
+	delete(p.directURLs, id)
+	var aborts []*mediaStream
+	for key, st := range p.streams {
+		if key == id || strings.HasPrefix(key, id+"@") {
+			aborts = append(aborts, st)
+		}
+	}
 	p.mu.Unlock()
-	if st != nil {
+	for _, st := range aborts {
 		st.abort()
 	}
-	paths, err := filepath.Glob(filepath.Join(p.cacheDir, id+".*"))
+	paths, err := filepath.Glob(filepath.Join(p.cacheDir, id+"*"))
 	if err != nil {
 		return err
 	}
@@ -194,6 +202,10 @@ func (p *Pipeline) run(id, sourceURL string, onUpdate func(protocol.Track)) {
 		return
 	}
 
+	if !strings.HasPrefix(sourceURL, uploadPrefix) {
+		go p.directURLFor(id, sourceURL)
+	}
+
 	st := newMediaStream()
 	p.mu.Lock()
 	p.streams[id] = st
@@ -257,57 +269,11 @@ func (p *Pipeline) run(id, sourceURL string, onUpdate func(protocol.Track)) {
 		}
 	}()
 
-	var total, lastPunch int64
-	var copyErr error
-	readyMarked := false
-	windowed := false
-	buf := make([]byte, tailChunkBytes)
-	for {
-		if windowed {
-			for {
-				_, observed, aborted := st.frontier()
-				if aborted || total-observed < windowAheadBytes {
-					break
-				}
-				select {
-				case <-st.abortCh:
-				case <-time.After(tailPollInterval):
-				}
-			}
-		}
-		if _, _, aborted := st.frontier(); aborted {
-			break
-		}
-		n, er := ffOut.Read(buf)
-		if n > 0 {
-			if _, we := pf.Write(buf[:n]); we != nil {
-				copyErr = we
-				break
-			}
-			total += int64(n)
-			st.advance(int64(n))
-			if !windowed && total >= windowEngageBytes {
-				windowed = true
-			}
-			if windowed {
-				_, observed, _ := st.frontier()
-				if off, length, ok := nextPunch(observed, lastPunch); ok {
-					_ = punchHole(pf, off, length)
-					lastPunch = off + length
-				}
-			}
-			if !readyMarked && durMs > 0 && total >= headBufferBytes {
-				readyMarked = true
-				p.markReady(id, fileURL, durMs, onUpdate)
-			}
-		}
-		if er != nil {
-			if er != io.EOF {
-				copyErr = er
-			}
-			break
-		}
+	var headReady func()
+	if durMs > 0 {
+		headReady = func() { p.markReady(id, fileURL, durMs, onUpdate) }
 	}
+	total, copyErr := p.pump(st, ffOut, pf, headReady)
 	pf.Close()
 	ffErr := ff.Wait()
 	_ = ytdlp.Wait()
@@ -339,6 +305,171 @@ func (p *Pipeline) run(id, sourceURL string, onUpdate func(protocol.Track)) {
 		durMs = probeDurationMs(out)
 	}
 	p.markReady(id, fileURL, durMs, onUpdate)
+}
+
+func (p *Pipeline) pump(st *mediaStream, out io.Reader, pf *os.File, headReady func()) (total int64, err error) {
+	var lastPunch int64
+	windowed := false
+	buf := make([]byte, tailChunkBytes)
+	for {
+		if windowed {
+			for {
+				_, observed, aborted := st.frontier()
+				if aborted || total-observed < windowAheadBytes {
+					break
+				}
+				select {
+				case <-st.abortCh:
+				case <-time.After(tailPollInterval):
+				}
+			}
+		}
+		if _, _, aborted := st.frontier(); aborted {
+			return total, nil
+		}
+		n, er := out.Read(buf)
+		if n > 0 {
+			if _, we := pf.Write(buf[:n]); we != nil {
+				return total, we
+			}
+			total += int64(n)
+			st.advance(int64(n))
+			if !windowed && total >= windowEngageBytes {
+				windowed = true
+			}
+			if windowed {
+				_, observed, _ := st.frontier()
+				if off, length, ok := nextPunch(observed, lastPunch); ok {
+					_ = punchHole(pf, off, length)
+					lastPunch = off + length
+				}
+			}
+			if headReady != nil && total >= headBufferBytes {
+				headReady()
+				headReady = nil
+			}
+		}
+		if er != nil {
+			if er != io.EOF {
+				return total, er
+			}
+			return total, nil
+		}
+	}
+}
+
+func (p *Pipeline) directURLFor(id, sourceURL string) string {
+	p.mu.Lock()
+	u := p.directURLs[id]
+	p.mu.Unlock()
+	if u != "" {
+		return u
+	}
+	out, err := exec.Command("yt-dlp", "-f", "bestaudio/best", "--no-playlist",
+		"--extractor-args", "youtube:player_client=web", "-g", sourceURL).Output()
+	if err != nil {
+		return ""
+	}
+	u = strings.TrimSpace(strings.SplitN(strings.TrimSpace(string(out)), "\n", 2)[0])
+	if u == "" {
+		return ""
+	}
+	p.mu.Lock()
+	p.directURLs[id] = u
+	p.mu.Unlock()
+	return u
+}
+
+func (p *Pipeline) ensureSegment(id, segID string, startSec int64) *mediaStream {
+	p.mu.Lock()
+	if st := p.streams[segID]; st != nil {
+		p.mu.Unlock()
+		return st
+	}
+	t, ok := p.tracks[id]
+	if !ok || t.SourceURL == "" || strings.HasPrefix(t.SourceURL, uploadPrefix) {
+		p.mu.Unlock()
+		return nil
+	}
+	sourceURL := t.SourceURL
+	st := newMediaStream()
+	p.streams[segID] = st
+	p.mu.Unlock()
+	go p.runSegment(id, segID, sourceURL, startSec, st)
+	return st
+}
+
+func (p *Pipeline) runSegment(id, segID, sourceURL string, startSec int64, st *mediaStream) {
+	part := filepath.Join(p.cacheDir, segID+".part")
+	_ = os.Remove(part)
+	pf, err := os.Create(part)
+	if err != nil {
+		st.fail()
+		p.mu.Lock()
+		delete(p.streams, segID)
+		p.mu.Unlock()
+		return
+	}
+
+	direct := p.directURLFor(id, sourceURL)
+	if direct == "" {
+		pf.Close()
+		_ = os.Remove(part)
+		st.fail()
+		p.mu.Lock()
+		delete(p.streams, segID)
+		p.mu.Unlock()
+		return
+	}
+
+	ff := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-user_agent", segUserAgent,
+		"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+		"-ss", strconv.FormatInt(startSec, 10),
+		"-i", direct,
+		"-vn", "-c:a", "libopus", "-b:a", audioBitrate,
+		"-f", "ogg", "pipe:1",
+	)
+	ffOut, err := ff.StdoutPipe()
+	if err != nil || ff.Start() != nil {
+		pf.Close()
+		st.fail()
+		_ = os.Remove(part)
+		p.mu.Lock()
+		delete(p.streams, segID)
+		p.mu.Unlock()
+		return
+	}
+	go func() {
+		<-st.abortCh
+		if ff.Process != nil {
+			_ = ff.Process.Kill()
+		}
+	}()
+
+	total, copyErr := p.pump(st, ffOut, pf, nil)
+	pf.Close()
+	ffErr := ff.Wait()
+
+	if _, _, aborted := st.frontier(); aborted {
+		st.fail()
+		_ = os.Remove(part)
+		p.mu.Lock()
+		delete(p.streams, segID)
+		p.mu.Unlock()
+		return
+	}
+	if copyErr != nil || ffErr != nil || total == 0 {
+		st.fail()
+		_ = os.Remove(part)
+		p.mu.Lock()
+		delete(p.streams, segID)
+		p.directURLs[id] = ""
+		p.mu.Unlock()
+		return
+	}
+	st.finish(total)
 }
 
 func (p *Pipeline) markReady(id, fileURL string, durMs int64, onUpdate func(protocol.Track)) {

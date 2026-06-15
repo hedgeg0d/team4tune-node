@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	audioBitrate     = "96k"
+	audioBitrate = "96k"
+	segUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
+		"(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
 	headBufferBytes  = 256 << 10
+	liveHeadBytes    = 48 << 10
 	tailPollInterval = 40 * time.Millisecond
 	tailChunkBytes   = 64 << 10
 )
@@ -93,11 +96,29 @@ func (s *mediaStream) frontier() (written, observed int64, aborted bool) {
 
 func (p *Pipeline) ServeMedia(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/media/")
-	id := strings.TrimSuffix(name, ".opus")
-	if id == "" || strings.ContainsAny(id, "/\\") || strings.Contains(id, "..") {
+	key := strings.TrimSuffix(name, ".opus")
+	if key == "" || strings.ContainsAny(key, "/\\") || strings.Contains(key, "..") {
 		http.NotFound(w, r)
 		return
 	}
+
+	if i := strings.Index(key, "__t"); i >= 0 {
+		id := key[:i]
+		sec, err := strconv.ParseInt(key[i+3:], 10, 64)
+		if id == "" || err != nil || sec <= 0 {
+			http.Error(w, "", http.StatusBadRequest)
+			return
+		}
+		segID := id + "@" + strconv.FormatInt(sec, 10)
+		seg := p.ensureSegment(id, segID, sec)
+		if seg == nil {
+			http.NotFound(w, r)
+			return
+		}
+		p.serveStream(w, r, segID, seg)
+		return
+	}
+	id := key
 
 	p.mu.Lock()
 	st := p.streams[id]
@@ -125,7 +146,7 @@ func (p *Pipeline) ServeMedia(w http.ResponseWriter, r *http.Request) {
 func (p *Pipeline) serveStream(w http.ResponseWriter, r *http.Request, id string, st *mediaStream) {
 	part := filepath.Join(p.cacheDir, id+".part")
 	f, err := os.Open(part)
-	if err != nil {
+	for err != nil {
 		if fi, e := os.Stat(filepath.Join(p.cacheDir, id+".opus")); e == nil {
 			if g, e2 := os.Open(filepath.Join(p.cacheDir, id+".opus")); e2 == nil {
 				defer g.Close()
@@ -133,8 +154,17 @@ func (p *Pipeline) serveStream(w http.ResponseWriter, r *http.Request, id string
 				return
 			}
 		}
-		http.NotFound(w, r)
-		return
+		if _, _, failed := st.snap(); failed || r.Context().Err() != nil {
+			http.NotFound(w, r)
+			return
+		}
+		select {
+		case <-r.Context().Done():
+			http.NotFound(w, r)
+			return
+		case <-time.After(tailPollInterval):
+		}
+		f, err = os.Open(part)
 	}
 	defer f.Close()
 
@@ -146,6 +176,10 @@ func (p *Pipeline) serveStream(w http.ResponseWriter, r *http.Request, id string
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+	if fl, ok := w.(http.Flusher); ok {
+		fl.Flush()
+	}
+	p.waitAvail(r, st, liveHeadBytes)
 	p.tailCopy(r, w, f, st)
 }
 

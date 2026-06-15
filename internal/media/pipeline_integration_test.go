@@ -1,11 +1,14 @@
 package media
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -95,5 +98,67 @@ func TestResolveStreamsLocalSource(t *testing.T) {
 	}
 	if fi.Size() == 0 {
 		t.Fatal("final opus is empty")
+	}
+}
+
+func TestSeekSegment(t *testing.T) {
+	requireTools(t)
+
+	srcDir := t.TempDir()
+	srcPath := filepath.Join(srcDir, "src.mp3")
+	gen := exec.Command("ffmpeg", "-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "sine=frequency=440:duration=12",
+		"-c:a", "libmp3lame", srcPath)
+	if err := gen.Run(); err != nil {
+		t.Skipf("could not generate source audio: %v", err)
+	}
+
+	fileSrv := httptest.NewServer(http.FileServer(http.Dir(srcDir)))
+	defer fileSrv.Close()
+
+	p := newTestPipeline(t)
+	media := httptest.NewServer(http.HandlerFunc(p.ServeMedia))
+	defer media.Close()
+
+	initial := p.Resolve(fileSrv.URL+"/src.mp3", nil)
+	id := initial.ID
+
+	req, _ := http.NewRequest(http.MethodGet, media.URL+"/media/"+id+"__t4.opus", nil)
+	req.Header.Set("Range", "bytes=0-")
+	var resp *http.Response
+	var err error
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		resp, err = http.DefaultClient.Do(req)
+		if err == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil {
+			resp.Body.Close()
+		}
+		time.Sleep(200 * time.Millisecond)
+		req, _ = http.NewRequest(http.MethodGet, media.URL+"/media/"+id+"__t4.opus", nil)
+		req.Header.Set("Range", "bytes=0-")
+	}
+	if err != nil {
+		t.Fatalf("segment request: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("segment status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if len(body) < 4 || string(body[:4]) != "OggS" {
+		t.Fatalf("segment did not start with Ogg magic, got %d bytes", len(body))
+	}
+
+	out, derr := exec.Command("ffprobe", "-v", "error",
+		"-show_entries", "format=duration", "-of", "default=nw=1:nokey=1",
+		filepath.Join(p.cacheDir, id+"@4.part")).Output()
+	if derr != nil {
+		t.Fatalf("segment not probeable: %v", derr)
+	}
+	if d, perr := strconv.ParseFloat(strings.TrimSpace(string(out)), 64); perr != nil || d < 6 || d > 9 {
+		t.Fatalf("segment duration = %q, want ~8s", out)
 	}
 }
