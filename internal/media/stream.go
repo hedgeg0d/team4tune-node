@@ -23,8 +23,8 @@ const (
 
 var (
 	windowEngageBytes int64 = 8 << 20
-	windowAheadBytes  int64 = 2 << 20
-	windowBackBytes   int64 = 2 << 20
+	windowAheadBytes  int64 = 3 << 20
+	windowBackBytes   int64 = 4 << 20
 	windowHeaderKeep  int64 = 128 << 10
 	windowPunchMin    int64 = 1 << 20
 )
