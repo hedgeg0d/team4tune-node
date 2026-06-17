@@ -447,6 +447,7 @@ func (p *Pipeline) runSegment(id, segID, sourceURL string, startSec int64, st *m
 			_ = ff.Process.Kill()
 		}
 	}()
+	go p.reapWhenIdle(segID, st)
 
 	total, copyErr := p.pump(st, ffOut, pf, nil)
 	pf.Close()
@@ -470,6 +471,28 @@ func (p *Pipeline) runSegment(id, segID, sourceURL string, startSec int64, st *m
 		return
 	}
 	st.finish(total)
+}
+
+func (p *Pipeline) reapWhenIdle(segID string, st *mediaStream) {
+	ticker := time.NewTicker(segmentReapTick)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-st.abortCh:
+			return
+		case <-ticker.C:
+			if st.idleReapable(segmentIdleTimeout) {
+				st.abort()
+				p.mu.Lock()
+				if p.streams[segID] == st {
+					delete(p.streams, segID)
+				}
+				p.mu.Unlock()
+				_ = os.Remove(filepath.Join(p.cacheDir, segID+".part"))
+				return
+			}
+		}
+	}
 }
 
 func (p *Pipeline) markReady(id, fileURL string, durMs int64, onUpdate func(protocol.Track)) {

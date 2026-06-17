@@ -15,10 +15,12 @@ const (
 	audioBitrate = "96k"
 	segUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
 		"(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36"
-	headBufferBytes  = 256 << 10
-	liveHeadBytes    = 48 << 10
-	tailPollInterval = 40 * time.Millisecond
-	tailChunkBytes   = 64 << 10
+	headBufferBytes    = 256 << 10
+	liveHeadBytes      = 48 << 10
+	tailPollInterval   = 40 * time.Millisecond
+	tailChunkBytes     = 64 << 10
+	segmentIdleTimeout = 30 * time.Second
+	segmentReapTick    = 5 * time.Second
 )
 
 var (
@@ -30,18 +32,42 @@ var (
 )
 
 type mediaStream struct {
-	mu       sync.Mutex
-	written  int64
-	observed int64
-	total    int64
-	done     bool
-	failed   bool
-	aborted  bool
-	abortCh  chan struct{}
+	mu        sync.Mutex
+	written   int64
+	observed  int64
+	total     int64
+	done      bool
+	failed    bool
+	aborted   bool
+	abortCh   chan struct{}
+	readers   int
+	idleSince time.Time
 }
 
 func newMediaStream() *mediaStream {
-	return &mediaStream{abortCh: make(chan struct{})}
+	return &mediaStream{abortCh: make(chan struct{}), idleSince: time.Now()}
+}
+
+func (s *mediaStream) addReader() {
+	s.mu.Lock()
+	s.readers++
+	s.mu.Unlock()
+}
+
+func (s *mediaStream) dropReader() {
+	s.mu.Lock()
+	s.readers--
+	if s.readers <= 0 {
+		s.readers = 0
+		s.idleSince = time.Now()
+	}
+	s.mu.Unlock()
+}
+
+func (s *mediaStream) idleReapable(timeout time.Duration) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.readers == 0 && time.Since(s.idleSince) > timeout
 }
 
 func (s *mediaStream) advance(n int64) {
@@ -144,6 +170,8 @@ func (p *Pipeline) ServeMedia(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *Pipeline) serveStream(w http.ResponseWriter, r *http.Request, id string, st *mediaStream) {
+	st.addReader()
+	defer st.dropReader()
 	part := filepath.Join(p.cacheDir, id+".part")
 	f, err := os.Open(part)
 	for err != nil {

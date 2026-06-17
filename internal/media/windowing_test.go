@@ -1,6 +1,9 @@
 package media
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func withWindowVars(t *testing.T, engage, ahead, back, header, punchMin int64) {
 	t.Helper()
@@ -9,6 +12,25 @@ func withWindowVars(t *testing.T, engage, ahead, back, header, punchMin int64) {
 	t.Cleanup(func() {
 		windowEngageBytes, windowAheadBytes, windowBackBytes, windowHeaderKeep, windowPunchMin = oe, oa, ob, oh, op
 	})
+}
+
+func TestSegmentIdleReap(t *testing.T) {
+	st := newMediaStream()
+	st.idleSince = time.Now().Add(-time.Minute)
+
+	if !st.idleReapable(30 * time.Second) {
+		t.Fatal("stream with no readers and old idleSince should be reapable")
+	}
+
+	st.addReader()
+	if st.idleReapable(30 * time.Second) {
+		t.Fatal("stream with an active reader must not be reapable")
+	}
+
+	st.dropReader()
+	if st.idleReapable(30 * time.Second) {
+		t.Fatal("freshly idle stream should wait out the timeout before reaping")
+	}
 }
 
 func TestNextPunch(t *testing.T) {
