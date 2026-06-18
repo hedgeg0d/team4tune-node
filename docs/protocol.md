@@ -96,7 +96,9 @@ future `t0`; `seek` sets `s` (and a new `t0` unless paused).
 
 Alongside the WebSocket, the server exposes plain HTTP:
 
-- `GET /media/<id>.opus` — serves a transcoded track. Supports Range (`206`).
+- `GET /media/<id>.opus` — serves a complete or in-progress Ogg/Opus track. Complete files support Range (`206`).
+- `GET /media/<id>/index.m3u8` — HLS playlist for long remote tracks. Segment URIs are relative to the playlist.
+- `GET /media/<id>/seg/<n>.ts` — lazily generated MPEG-TS/AAC HLS segment for absolute segment index `n`.
 - `POST /upload` — `multipart/form-data` with field `file` (an **Ogg/Opus** file) and
   optional `title`. The client encodes the Opus locally (no server transcode); the server
   stores it under a content hash, verifies the codec is Opus, probes duration, and returns

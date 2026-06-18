@@ -35,6 +35,7 @@ type Pipeline struct {
 	tracks     map[string]*protocol.Track
 	streams    map[string]*mediaStream
 	directURLs map[string]string
+	hlsJobs    map[string]*hlsJob
 }
 
 func New(cacheDir, baseURL string) (*Pipeline, error) {
@@ -47,6 +48,7 @@ func New(cacheDir, baseURL string) (*Pipeline, error) {
 		tracks:     make(map[string]*protocol.Track),
 		streams:    make(map[string]*mediaStream),
 		directURLs: make(map[string]string),
+		hlsJobs:    make(map[string]*hlsJob),
 	}, nil
 }
 
@@ -71,7 +73,7 @@ func (p *Pipeline) Delete(id string) error {
 		return err
 	}
 	for _, path := range paths {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		if err := os.RemoveAll(path); err != nil && !os.IsNotExist(err) {
 			return err
 		}
 	}
@@ -204,6 +206,10 @@ func (p *Pipeline) run(id, sourceURL string, onUpdate func(protocol.Track)) {
 
 	if !strings.HasPrefix(sourceURL, uploadPrefix) {
 		go p.directURLFor(id, sourceURL)
+		if durMs >= hlsDurationThresholdMs {
+			p.markReady(id, p.baseURL+"/media/"+id+"/index.m3u8", durMs, onUpdate)
+			return
+		}
 	}
 
 	st := newMediaStream()

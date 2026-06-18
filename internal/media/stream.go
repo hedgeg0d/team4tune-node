@@ -122,6 +122,14 @@ func (s *mediaStream) frontier() (written, observed int64, aborted bool) {
 
 func (p *Pipeline) ServeMedia(w http.ResponseWriter, r *http.Request) {
 	name := strings.TrimPrefix(r.URL.Path, "/media/")
+	if id, ok := hlsPlaylistID(name); ok {
+		p.serveHLSPlaylist(w, r, id)
+		return
+	}
+	if id, segment, ok := hlsSegmentID(name); ok {
+		p.serveHLSSegment(w, r, id, segment)
+		return
+	}
 	key := strings.TrimSuffix(name, ".opus")
 	if key == "" || strings.ContainsAny(key, "/\\") || strings.Contains(key, "..") {
 		http.NotFound(w, r)
@@ -262,6 +270,30 @@ func (p *Pipeline) waitAvail(r *http.Request, st *mediaStream, want int64) (avai
 		case <-time.After(tailPollInterval):
 		}
 	}
+}
+
+func hlsPlaylistID(name string) (string, bool) {
+	id, ok := strings.CutSuffix(name, "/index.m3u8")
+	if !ok || !validMediaID(id) {
+		return "", false
+	}
+	return id, true
+}
+
+func hlsSegmentID(name string) (string, int64, bool) {
+	id, rest, ok := strings.Cut(name, "/seg/")
+	if !ok || !validMediaID(id) || !strings.HasSuffix(rest, ".ts") {
+		return "", 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSuffix(rest, ".ts"), 10, 64)
+	if err != nil || n < 0 {
+		return "", 0, false
+	}
+	return id, n, true
+}
+
+func validMediaID(id string) bool {
+	return id != "" && !strings.ContainsAny(id, "/\\") && !strings.Contains(id, "..")
 }
 
 func parseRange(h string) (start, end int64, hasRange, ok bool) {
