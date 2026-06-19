@@ -16,6 +16,7 @@ const (
 	hlsDurationThresholdMs int64 = 10 * 60 * 1000
 	hlsSegmentMs           int64 = 6000
 	hlsAudioBitrate              = "128k"
+	hlsReadAhead           int64 = 2
 )
 
 type hlsJob struct {
@@ -40,9 +41,6 @@ func (p *Pipeline) serveHLSPlaylist(w http.ResponseWriter, r *http.Request, id s
 	b.WriteByte('\n')
 	b.WriteString("#EXT-X-MEDIA-SEQUENCE:0\n")
 	for i := int64(0); i < count; i++ {
-		if i > 0 {
-			b.WriteString("#EXT-X-DISCONTINUITY\n")
-		}
 		dur := hlsSegmentMs
 		if remain := track.DurationMs - i*hlsSegmentMs; remain < dur {
 			dur = remain
@@ -78,6 +76,7 @@ func (p *Pipeline) serveHLSSegment(w http.ResponseWriter, r *http.Request, id st
 			return
 		}
 	}
+	go p.warmHLSSegments(track, segment+1, hlsReadAhead)
 	f, err := os.Open(path)
 	if err != nil {
 		http.NotFound(w, r)
@@ -105,11 +104,25 @@ func (p *Pipeline) ensureHLSSegment(track protocol.Track, segment int64) error {
 	p.hlsJobs[key] = job
 	p.mu.Unlock()
 	job.err = p.generateHLSSegment(track, segment)
+	if job.err != nil {
+		p.clearDirectURL(track.ID)
+		job.err = p.generateHLSSegment(track, segment)
+	}
 	close(job.done)
 	p.mu.Lock()
 	delete(p.hlsJobs, key)
 	p.mu.Unlock()
 	return job.err
+}
+
+func (p *Pipeline) warmHLSSegments(track protocol.Track, from, n int64) {
+	count := (track.DurationMs + hlsSegmentMs - 1) / hlsSegmentMs
+	for i := from; i < from+n && i < count; i++ {
+		if _, err := os.Stat(p.hlsSegmentPath(track.ID, i)); err == nil {
+			continue
+		}
+		_ = p.ensureHLSSegment(track, i)
+	}
 }
 
 func (p *Pipeline) hlsSegmentPath(id string, segment int64) string {
@@ -144,13 +157,12 @@ func (p *Pipeline) generateHLSSegment(track protocol.Track, segment int64) error
 		"-i", direct,
 		"-t", formatFFmpegSeconds(durMs),
 		"-vn", "-c:a", "aac", "-b:a", hlsAudioBitrate, "-ar", "48000", "-ac", "2",
+		"-muxdelay", "0", "-muxpreload", "0",
+		"-output_ts_offset", formatFFmpegSeconds(startMs),
 		"-f", "mpegts", tmp,
 	)
 	if err := cmd.Run(); err != nil {
 		_ = os.Remove(tmp)
-		p.mu.Lock()
-		p.directURLs[track.ID] = ""
-		p.mu.Unlock()
 		return err
 	}
 	return os.Rename(tmp, path)

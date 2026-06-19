@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/team4tune/node-server/internal/protocol"
 )
@@ -92,5 +93,18 @@ func TestServeHLSSegmentGeneratesOnce(t *testing.T) {
 	}
 	if _, err := os.Stat(p.hlsSegmentPath(id, 0)); err != nil {
 		t.Fatalf("cached segment missing: %v", err)
+	}
+
+	deadline := time.Now().Add(20 * time.Second)
+	warmed := false
+	for time.Now().Before(deadline) {
+		if _, err := os.Stat(p.hlsSegmentPath(id, 1)); err == nil {
+			warmed = true
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !warmed {
+		t.Fatal("read-ahead did not warm the next segment")
 	}
 }
