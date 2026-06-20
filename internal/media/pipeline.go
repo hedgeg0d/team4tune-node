@@ -38,6 +38,7 @@ type Pipeline struct {
 	streams    map[string]*mediaStream
 	directURLs map[string]string
 	hlsJobs    map[string]*hlsJob
+	segSem     chan struct{}
 }
 
 func New(cacheDir, baseURL string) (*Pipeline, error) {
@@ -51,6 +52,7 @@ func New(cacheDir, baseURL string) (*Pipeline, error) {
 		streams:    make(map[string]*mediaStream),
 		directURLs: make(map[string]string),
 		hlsJobs:    make(map[string]*hlsJob),
+		segSem:     make(chan struct{}, hlsSegConcurrency),
 	}, nil
 }
 
@@ -305,7 +307,7 @@ func (p *Pipeline) directURLFor(id, sourceURL string) string {
 	if u != "" {
 		return u
 	}
-	out, err := exec.Command("yt-dlp", "-f", "bestaudio/best", "--no-playlist",
+	out, err := exec.Command("yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio/best", "--no-playlist",
 		"--extractor-args", "youtube:player_client=android_vr", "-g", sourceURL).Output()
 	if err != nil {
 		return ""

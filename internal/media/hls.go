@@ -16,7 +16,8 @@ const (
 	hlsDurationThresholdMs int64 = 10 * 60 * 1000
 	hlsSegmentMs           int64 = 6000
 	hlsAudioBitrate              = "128k"
-	hlsReadAhead           int64 = 2
+	hlsReadAhead           int64 = 4
+	hlsSegConcurrency            = 5
 )
 
 type hlsJob struct {
@@ -103,11 +104,13 @@ func (p *Pipeline) ensureHLSSegment(track protocol.Track, segment int64) error {
 	job := &hlsJob{done: make(chan struct{})}
 	p.hlsJobs[key] = job
 	p.mu.Unlock()
+	p.segSem <- struct{}{}
 	job.err = p.generateHLSSegment(track, segment)
 	if job.err != nil {
 		p.clearDirectURL(track.ID)
 		job.err = p.generateHLSSegment(track, segment)
 	}
+	<-p.segSem
 	close(job.done)
 	p.mu.Lock()
 	delete(p.hlsJobs, key)
@@ -121,7 +124,7 @@ func (p *Pipeline) warmHLSSegments(track protocol.Track, from, n int64) {
 		if _, err := os.Stat(p.hlsSegmentPath(track.ID, i)); err == nil {
 			continue
 		}
-		_ = p.ensureHLSSegment(track, i)
+		go func(seg int64) { _ = p.ensureHLSSegment(track, seg) }(i)
 	}
 }
 
@@ -149,23 +152,37 @@ func (p *Pipeline) generateHLSSegment(track protocol.Track, segment int64) error
 	}
 	tmp := path + ".tmp"
 	_ = os.Remove(tmp)
-	cmd := exec.Command("ffmpeg",
+	if err := runHLSSegmentFFmpeg(direct, startMs, durMs, tmp, true); err != nil {
+		_ = os.Remove(tmp)
+		if err := runHLSSegmentFFmpeg(direct, startMs, durMs, tmp, false); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+	return os.Rename(tmp, path)
+}
+
+func runHLSSegmentFFmpeg(direct string, startMs, durMs int64, out string, copyAudio bool) error {
+	args := []string{
 		"-hide_banner", "-loglevel", "error",
 		"-user_agent", segUserAgent,
 		"-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
 		"-ss", formatFFmpegSeconds(startMs),
 		"-i", direct,
 		"-t", formatFFmpegSeconds(durMs),
-		"-vn", "-c:a", "aac", "-b:a", hlsAudioBitrate, "-ar", "48000", "-ac", "2",
+		"-vn",
+	}
+	if copyAudio {
+		args = append(args, "-c:a", "copy")
+	} else {
+		args = append(args, "-c:a", "aac", "-b:a", hlsAudioBitrate, "-ar", "48000", "-ac", "2")
+	}
+	args = append(args,
 		"-muxdelay", "0", "-muxpreload", "0",
 		"-output_ts_offset", formatFFmpegSeconds(startMs),
-		"-f", "mpegts", tmp,
+		"-f", "mpegts", out,
 	)
-	if err := cmd.Run(); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return os.Rename(tmp, path)
+	return exec.Command("ffmpeg", args...).Run()
 }
 
 func formatHLSDuration(ms int64) string {
