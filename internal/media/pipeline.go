@@ -33,12 +33,15 @@ type Pipeline struct {
 	cacheDir string
 	baseURL  string
 
-	mu         sync.Mutex
-	tracks     map[string]*protocol.Track
-	streams    map[string]*mediaStream
-	directURLs map[string]string
-	hlsJobs    map[string]*hlsJob
-	segSem     chan struct{}
+	mu          sync.Mutex
+	tracks      map[string]*protocol.Track
+	streams     map[string]*mediaStream
+	directURLs  map[string]string
+	hlsJobs     map[string]*hlsJob
+	segSem      chan struct{}
+	notify      map[string]func(protocol.Track)
+	fullJobs    map[string]chan struct{}
+	fullDesired map[string]bool
 }
 
 func New(cacheDir, baseURL string) (*Pipeline, error) {
@@ -46,13 +49,16 @@ func New(cacheDir, baseURL string) (*Pipeline, error) {
 		return nil, err
 	}
 	return &Pipeline{
-		cacheDir:   cacheDir,
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		tracks:     make(map[string]*protocol.Track),
-		streams:    make(map[string]*mediaStream),
-		directURLs: make(map[string]string),
-		hlsJobs:    make(map[string]*hlsJob),
-		segSem:     make(chan struct{}, hlsSegConcurrency),
+		cacheDir:    cacheDir,
+		baseURL:     strings.TrimRight(baseURL, "/"),
+		tracks:      make(map[string]*protocol.Track),
+		streams:     make(map[string]*mediaStream),
+		directURLs:  make(map[string]string),
+		hlsJobs:     make(map[string]*hlsJob),
+		segSem:      make(chan struct{}, hlsSegConcurrency),
+		notify:      make(map[string]func(protocol.Track)),
+		fullJobs:    make(map[string]chan struct{}),
+		fullDesired: make(map[string]bool),
 	}, nil
 }
 
@@ -62,6 +68,8 @@ func (p *Pipeline) Delete(id string) error {
 	p.mu.Lock()
 	delete(p.tracks, id)
 	delete(p.directURLs, id)
+	delete(p.notify, id)
+	delete(p.fullDesired, id)
 	var aborts []*mediaStream
 	if st := p.streams[id]; st != nil {
 		aborts = append(aborts, st)
@@ -146,6 +154,9 @@ func (p *Pipeline) Resolve(sourceURL string, onUpdate func(protocol.Track)) prot
 	id := p.idFor(sourceURL)
 
 	p.mu.Lock()
+	if onUpdate != nil {
+		p.notify[id] = onUpdate
+	}
 	if t, ok := p.tracks[id]; ok {
 		snap := *t
 		p.mu.Unlock()

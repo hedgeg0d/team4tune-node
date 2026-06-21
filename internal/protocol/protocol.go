@@ -85,21 +85,29 @@ const (
 	ControlSeek   = "seek"
 )
 
+const (
+	MemLimitMinMB     = 2
+	MemLimitMaxMB     = 100
+	MemLimitDefaultMB = 50
+)
+
 type RoomSettings struct {
-	Enqueue Policy   `json:"enqueue"`
-	Skip    Policy   `json:"skip"`
-	Remove  Policy   `json:"remove"`
-	Control Policy   `json:"control"`
-	Sync    SyncMode `json:"sync"`
+	Enqueue    Policy   `json:"enqueue"`
+	Skip       Policy   `json:"skip"`
+	Remove     Policy   `json:"remove"`
+	Control    Policy   `json:"control"`
+	Sync       SyncMode `json:"sync"`
+	MemLimitMB int      `json:"memLimitMb"`
 }
 
 func DefaultSettings() RoomSettings {
 	return RoomSettings{
-		Enqueue: PolicyEveryone,
-		Skip:    PolicyEveryone,
-		Remove:  PolicyEveryone,
-		Control: PolicyEveryone,
-		Sync:    SyncResponsive,
+		Enqueue:    PolicyEveryone,
+		Skip:       PolicyEveryone,
+		Remove:     PolicyEveryone,
+		Control:    PolicyEveryone,
+		Sync:       SyncResponsive,
+		MemLimitMB: MemLimitDefaultMB,
 	}
 }
 

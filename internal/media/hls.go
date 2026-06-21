@@ -94,6 +94,9 @@ func (p *Pipeline) serveHLSSegment(w http.ResponseWriter, r *http.Request, id st
 }
 
 func (p *Pipeline) ensureHLSSegment(track protocol.Track, segment int64) error {
+	if !p.exists(track.ID) {
+		return os.ErrNotExist
+	}
 	key := track.ID + ":" + strconv.FormatInt(segment, 10)
 	p.mu.Lock()
 	if job := p.hlsJobs[key]; job != nil {
@@ -119,6 +122,9 @@ func (p *Pipeline) ensureHLSSegment(track protocol.Track, segment int64) error {
 }
 
 func (p *Pipeline) warmHLSSegments(track protocol.Track, from, n int64) {
+	if !p.exists(track.ID) {
+		return
+	}
 	count := (track.DurationMs + hlsSegmentMs - 1) / hlsSegmentMs
 	for i := from; i < from+n && i < count; i++ {
 		if _, err := os.Stat(p.hlsSegmentPath(track.ID, i)); err == nil {
@@ -133,6 +139,9 @@ func (p *Pipeline) hlsSegmentPath(id string, segment int64) string {
 }
 
 func (p *Pipeline) generateHLSSegment(track protocol.Track, segment int64) error {
+	if !p.exists(track.ID) {
+		return os.ErrNotExist
+	}
 	dir := filepath.Join(p.cacheDir, track.ID+".hls")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
@@ -158,6 +167,11 @@ func (p *Pipeline) generateHLSSegment(track protocol.Track, segment int64) error
 			_ = os.Remove(tmp)
 			return err
 		}
+	}
+	if !p.exists(track.ID) {
+		_ = os.Remove(tmp)
+		_ = os.Remove(dir)
+		return os.ErrNotExist
 	}
 	return os.Rename(tmp, path)
 }

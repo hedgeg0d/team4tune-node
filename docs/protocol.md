@@ -19,7 +19,7 @@ This document is the source of truth shared by `team4tune-node-server` and
 | `skip` | `{}` | Skip the current track. Gated by `skip` policy. |
 | `remove` | `{ trackId }` | Remove a queued track (not the current one). Gated by `remove` policy. |
 | `control` | `{ action, seekMs? }` | `action`: `pause` \| `resume` \| `seek` (`seekMs` for seek). Gated by `control` policy. |
-| `set_settings` | `{ enqueue, skip, remove, control, sync }` | Replace room settings. **Host only.** |
+| `set_settings` | `{ enqueue, skip, remove, control, sync, memLimitMb }` | Replace room settings. **Host only.** |
 | `ready` | `{ trackId }` | Signal mode: this client can start (buffer lead reached / downloaded). |
 | `progress` | `{ trackId, haveMs, totalMs, bps, ready, confidence }` | Download/playback telemetry (~1/s). Drives adaptive start + member health. |
 | `bye` | `{}` | Intentional leave: immediate departure (no resume grace, frees host now). |
@@ -37,9 +37,11 @@ This document is the source of truth shared by `team4tune-node-server` and
 
 ## Permissions & host
 
-`settings` is `{ enqueue, skip, remove, control, sync }`. The four scopes are each a
-**policy** of `"everyone"` or `"host"` (default `everyone`). `sync` is the start policy
-(below).
+`settings` is `{ enqueue, skip, remove, control, sync, memLimitMb }`. The four scopes are
+each a **policy** of `"everyone"` or `"host"` (default `everyone`). `sync` is the start
+policy (below). `memLimitMb` (2–100, default 50) is the room's media cache budget: the
+server keeps as many upcoming tracks fully downloaded (best seeking) as fit the budget and
+streams the rest on demand as HLS, evicting tracks that leave the queue.
 
 The **host** is the room creator, identified by an ephemeral session id (`hostId`); no
 accounts, no credential. On disconnect the host slot is held for a resume grace window

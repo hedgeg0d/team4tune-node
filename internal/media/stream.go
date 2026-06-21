@@ -49,12 +49,20 @@ func (p *Pipeline) ServeMedia(w http.ResponseWriter, r *http.Request) {
 		p.serveHLSSegment(w, r, id, segment)
 		return
 	}
-	key := strings.TrimSuffix(name, ".opus")
+	var key, ext string
+	if k, ok := strings.CutSuffix(name, ".opus"); ok {
+		key, ext = k, ".opus"
+	} else if k, ok := strings.CutSuffix(name, ".m4a"); ok {
+		key, ext = k, ".m4a"
+	} else {
+		http.NotFound(w, r)
+		return
+	}
 	if !validMediaID(key) {
 		http.NotFound(w, r)
 		return
 	}
-	final := filepath.Join(p.cacheDir, key+".opus")
+	final := filepath.Join(p.cacheDir, key+ext)
 	fi, err := os.Stat(final)
 	if err != nil {
 		http.NotFound(w, r)
@@ -66,7 +74,10 @@ func (p *Pipeline) ServeMedia(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	http.ServeContent(w, r, key+".opus", fi.ModTime(), f)
+	if ext == ".m4a" {
+		w.Header().Set("Content-Type", "audio/mp4")
+	}
+	http.ServeContent(w, r, key+ext, fi.ModTime(), f)
 }
 
 func hlsPlaylistID(name string) (string, bool) {

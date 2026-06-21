@@ -281,6 +281,7 @@ func (room *Room) endTrack(trackID string) {
 	room.cleanTrackFile(trackID)
 	room.broadcastState()
 	room.maybeStart()
+	room.reconcileCache()
 }
 
 func (room *Room) catchUp(c *Client) {

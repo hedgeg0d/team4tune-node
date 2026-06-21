@@ -8,10 +8,15 @@ import (
 	"sync"
 	"time"
 
+	"github.com/team4tune/node-server/internal/media"
 	"github.com/team4tune/node-server/internal/protocol"
 )
 
 var ErrRoomNotFound = errors.New("room not found")
+
+type CacheManager interface {
+	Reconcile(tracks []media.ReconcileTrack, budgetMB int)
+}
 
 const (
 	resumeTTL    = 60 * time.Second
@@ -50,6 +55,7 @@ type Room struct {
 	pending    map[string]*pendingClient
 	emptyTimer *time.Timer
 	cleanTrack func(string)
+	cache      CacheManager
 }
 
 type Registry struct {
@@ -57,7 +63,14 @@ type Registry struct {
 	rooms        map[string]*Room
 	udpPort      int
 	cleanTrack   func(string)
+	cacheMgr     CacheManager
 	emptyRoomTTL time.Duration
+}
+
+func (r *Registry) SetCacheManager(cm CacheManager) {
+	r.mu.Lock()
+	r.cacheMgr = cm
+	r.mu.Unlock()
 }
 
 func NewRegistry() *Registry {
@@ -98,6 +111,7 @@ func (r *Registry) Create(mode protocol.RoomMode) *Room {
 		tokens:     make(map[string]string),
 		pending:    make(map[string]*pendingClient),
 		cleanTrack: r.cleanIfUnused,
+		cache:      r.cacheMgr,
 	}
 	r.rooms[code] = room
 	return room
@@ -377,10 +391,17 @@ func (room *Room) SetSettings(s protocol.RoomSettings) {
 	if s.Sync != protocol.SyncResponsive && s.Sync != protocol.SyncTight {
 		s.Sync = protocol.SyncResponsive
 	}
+	if s.MemLimitMB < protocol.MemLimitMinMB {
+		s.MemLimitMB = protocol.MemLimitMinMB
+	}
+	if s.MemLimitMB > protocol.MemLimitMaxMB {
+		s.MemLimitMB = protocol.MemLimitMaxMB
+	}
 	room.mu.Lock()
 	room.settings = s
 	room.mu.Unlock()
 	room.broadcastState()
+	room.reconcileCache()
 }
 
 func (room *Room) sendTo(clientID string, env protocol.Envelope) {
@@ -425,6 +446,28 @@ func (room *Room) RemoveTrack(trackID string) {
 	}
 	room.mu.Unlock()
 	room.broadcastState()
+	room.reconcileCache()
+}
+
+func (room *Room) reconcileCache() {
+	room.mu.Lock()
+	cm := room.cache
+	if cm == nil {
+		room.mu.Unlock()
+		return
+	}
+	budget := room.settings.MemLimitMB
+	plan := make([]media.ReconcileTrack, 0, len(room.queue))
+	for _, t := range room.queue {
+		plan = append(plan, media.ReconcileTrack{
+			ID:         t.ID,
+			SourceURL:  t.SourceURL,
+			DurationMs: t.DurationMs,
+			Playing:    room.playing != nil && room.playing.trackID == t.ID,
+		})
+	}
+	room.mu.Unlock()
+	cm.Reconcile(plan, budget)
 }
 
 func (room *Room) AddTrack(t protocol.Track) {
@@ -433,6 +476,7 @@ func (room *Room) AddTrack(t protocol.Track) {
 	room.mu.Unlock()
 	room.broadcastState()
 	room.maybeStart()
+	room.reconcileCache()
 }
 
 func (room *Room) UpsertTrack(t protocol.Track) {
@@ -451,6 +495,7 @@ func (room *Room) UpsertTrack(t protocol.Track) {
 	room.mu.Unlock()
 	room.broadcastState()
 	room.maybeStart()
+	room.reconcileCache()
 }
 
 func (room *Room) snapshot(selfID string) protocol.RoomStateData {
