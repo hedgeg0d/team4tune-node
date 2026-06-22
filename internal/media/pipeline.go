@@ -2,6 +2,7 @@ package media
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -12,11 +13,14 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/team4tune/node-server/internal/protocol"
 )
 
 const uploadPrefix = "upload://"
+
+const ytdlpTimeout = 25 * time.Second
 
 var (
 	ErrNotOpus   = errors.New("not an opus file")
@@ -318,7 +322,9 @@ func (p *Pipeline) directURLFor(id, sourceURL string) string {
 	if u != "" {
 		return u
 	}
-	out, err := exec.Command("yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio/best", "--no-playlist",
+	ctx, cancel := context.WithTimeout(context.Background(), ytdlpTimeout)
+	defer cancel()
+	out, err := exec.CommandContext(ctx, "yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio/best", "--no-playlist",
 		"--extractor-args", "youtube:player_client=android_vr", "-g", sourceURL).Output()
 	if err != nil {
 		return ""
@@ -357,7 +363,9 @@ func trackID(sourceURL string) string {
 }
 
 func probeMeta(sourceURL string) (title string, durationMs int64) {
-	cmd := exec.Command("yt-dlp", "--no-playlist", "--skip-download",
+	ctx, cancel := context.WithTimeout(context.Background(), ytdlpTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "yt-dlp", "--no-playlist", "--skip-download",
 		"--print", "%(title)s", "--print", "%(duration)s", sourceURL)
 	out, err := cmd.Output()
 	if err != nil {

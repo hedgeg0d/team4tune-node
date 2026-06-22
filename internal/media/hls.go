@@ -1,6 +1,7 @@
 package media
 
 import (
+	"context"
 	"fmt"
 	"net/http"
 	"os"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/team4tune/node-server/internal/protocol"
 )
@@ -18,6 +20,7 @@ const (
 	hlsAudioBitrate              = "128k"
 	hlsReadAhead           int64 = 4
 	hlsSegConcurrency            = 5
+	hlsSegmentTimeout            = 25 * time.Second
 )
 
 type hlsJob struct {
@@ -196,7 +199,9 @@ func runHLSSegmentFFmpeg(direct string, startMs, durMs int64, out string, copyAu
 		"-output_ts_offset", formatFFmpegSeconds(startMs),
 		"-f", "mpegts", out,
 	)
-	return exec.Command("ffmpeg", args...).Run()
+	ctx, cancel := context.WithTimeout(context.Background(), hlsSegmentTimeout)
+	defer cancel()
+	return exec.CommandContext(ctx, "ffmpeg", args...).Run()
 }
 
 func formatHLSDuration(ms int64) string {
