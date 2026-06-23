@@ -164,9 +164,10 @@ func (p *Pipeline) generateHLSSegment(track protocol.Track, segment int64) error
 	}
 	tmp := path + ".tmp"
 	_ = os.Remove(tmp)
-	if err := runHLSSegmentFFmpeg(direct, startMs, durMs, tmp, true); err != nil {
+	ctx := p.ctxFor(track.ID)
+	if err := runHLSSegmentFFmpeg(ctx, direct, startMs, durMs, tmp, true); err != nil {
 		_ = os.Remove(tmp)
-		if err := runHLSSegmentFFmpeg(direct, startMs, durMs, tmp, false); err != nil {
+		if err := runHLSSegmentFFmpeg(ctx, direct, startMs, durMs, tmp, false); err != nil {
 			_ = os.Remove(tmp)
 			return err
 		}
@@ -179,7 +180,7 @@ func (p *Pipeline) generateHLSSegment(track protocol.Track, segment int64) error
 	return os.Rename(tmp, path)
 }
 
-func runHLSSegmentFFmpeg(direct string, startMs, durMs int64, out string, copyAudio bool) error {
+func runHLSSegmentFFmpeg(parent context.Context, direct string, startMs, durMs int64, out string, copyAudio bool) error {
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
 		"-user_agent", segUserAgent,
@@ -199,7 +200,7 @@ func runHLSSegmentFFmpeg(direct string, startMs, durMs int64, out string, copyAu
 		"-output_ts_offset", formatFFmpegSeconds(startMs),
 		"-f", "mpegts", out,
 	)
-	ctx, cancel := context.WithTimeout(context.Background(), hlsSegmentTimeout)
+	ctx, cancel := context.WithTimeout(parent, hlsSegmentTimeout)
 	defer cancel()
 	return exec.CommandContext(ctx, "ffmpeg", args...).Run()
 }

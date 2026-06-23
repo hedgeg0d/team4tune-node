@@ -46,6 +46,8 @@ type Pipeline struct {
 	notify      map[string]func(protocol.Track)
 	fullJobs    map[string]chan struct{}
 	fullDesired map[string]bool
+	ctxs        map[string]context.Context
+	cancels     map[string]context.CancelFunc
 }
 
 func New(cacheDir, baseURL string) (*Pipeline, error) {
@@ -63,7 +65,19 @@ func New(cacheDir, baseURL string) (*Pipeline, error) {
 		notify:      make(map[string]func(protocol.Track)),
 		fullJobs:    make(map[string]chan struct{}),
 		fullDesired: make(map[string]bool),
+		ctxs:        make(map[string]context.Context),
+		cancels:     make(map[string]context.CancelFunc),
 	}, nil
+}
+
+func (p *Pipeline) ctxFor(id string) context.Context {
+	p.mu.Lock()
+	ctx := p.ctxs[id]
+	p.mu.Unlock()
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func (p *Pipeline) CacheDir() string { return p.cacheDir }
@@ -74,6 +88,11 @@ func (p *Pipeline) Delete(id string) error {
 	delete(p.directURLs, id)
 	delete(p.notify, id)
 	delete(p.fullDesired, id)
+	if cancel := p.cancels[id]; cancel != nil {
+		cancel()
+	}
+	delete(p.cancels, id)
+	delete(p.ctxs, id)
 	var aborts []*mediaStream
 	if st := p.streams[id]; st != nil {
 		aborts = append(aborts, st)
@@ -150,6 +169,11 @@ func (p *Pipeline) RegisterOpus(r io.Reader, title string) (protocol.Track, erro
 	p.mu.Lock()
 	t := track
 	p.tracks[id] = &t
+	if _, ok := p.cancels[id]; !ok {
+		ctx, cancel := context.WithCancel(context.Background())
+		p.ctxs[id] = ctx
+		p.cancels[id] = cancel
+	}
 	p.mu.Unlock()
 	return track, nil
 }
@@ -172,6 +196,9 @@ func (p *Pipeline) Resolve(sourceURL string, onUpdate func(protocol.Track)) prot
 		Status:    StatusResolving,
 	}
 	p.tracks[id] = t
+	ctx, cancel := context.WithCancel(context.Background())
+	p.ctxs[id] = ctx
+	p.cancels[id] = cancel
 	snap := *t
 	p.mu.Unlock()
 
@@ -322,7 +349,7 @@ func (p *Pipeline) directURLFor(id, sourceURL string) string {
 	if u != "" {
 		return u
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), ytdlpTimeout)
+	ctx, cancel := context.WithTimeout(p.ctxFor(id), ytdlpTimeout)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "yt-dlp", "-f", "bestaudio[ext=m4a]/bestaudio/best", "--no-playlist",
 		"--extractor-args", "youtube:player_client=android_vr", "-g", sourceURL).Output()
