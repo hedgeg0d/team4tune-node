@@ -10,6 +10,7 @@ import (
 
 	"github.com/team4tune/node-server/internal/media"
 	"github.com/team4tune/node-server/internal/protocol"
+	"github.com/team4tune/node-server/internal/rtc"
 )
 
 var ErrRoomNotFound = errors.New("room not found")
@@ -42,20 +43,22 @@ type Room struct {
 	Code string
 	Mode protocol.RoomMode
 
-	mu         sync.Mutex
-	clients    map[string]*Client
-	queue      []protocol.Track
-	playing    *playback
-	hostID     string
-	seqCounter int64
-	settings   protocol.RoomSettings
-	health     map[string]*protocol.Health
-	udpPort    int
-	tokens     map[string]string
-	pending    map[string]*pendingClient
-	emptyTimer *time.Timer
-	cleanTrack func(string)
-	cache      CacheManager
+	mu          sync.Mutex
+	clients     map[string]*Client
+	queue       []protocol.Track
+	playing     *playback
+	hostID      string
+	seqCounter  int64
+	settings    protocol.RoomSettings
+	health      map[string]*protocol.Health
+	udpPort     int
+	tokens      map[string]string
+	pending     map[string]*pendingClient
+	emptyTimer  *time.Timer
+	cleanTrack  func(string)
+	cache       CacheManager
+	broadcaster *rtc.Broadcaster
+	streamSrc   StreamResolver
 }
 
 type Registry struct {
@@ -64,6 +67,7 @@ type Registry struct {
 	udpPort      int
 	cleanTrack   func(string)
 	cacheMgr     CacheManager
+	streamSrc    StreamResolver
 	emptyRoomTTL time.Duration
 }
 
@@ -112,6 +116,12 @@ func (r *Registry) Create(mode protocol.RoomMode) *Room {
 		pending:    make(map[string]*pendingClient),
 		cleanTrack: r.cleanIfUnused,
 		cache:      r.cacheMgr,
+		streamSrc:  r.streamSrc,
+	}
+	if mode == protocol.ModeStream && r.streamSrc != nil {
+		if bc, err := rtc.New(room.sendTo, r.streamSrc.StreamInput); err == nil {
+			room.broadcaster = bc
+		}
 	}
 	r.rooms[code] = room
 	return room
@@ -219,7 +229,11 @@ func (room *Room) cleanupMedia() {
 	room.playing = nil
 	room.queue = nil
 	clean := room.cleanTrack
+	bc := room.broadcaster
 	room.mu.Unlock()
+	if bc != nil {
+		bc.Close()
+	}
 	if clean == nil {
 		return
 	}
@@ -287,6 +301,7 @@ func (room *Room) Leave(reg *Registry, c *Client) {
 	}
 	clientID := c.ID
 	delete(room.clients, clientID)
+	room.removeStreamPeer(clientID)
 	if c.Token != "" {
 		room.pending[clientID] = &pendingClient{
 			seq:   c.Seq,
@@ -316,6 +331,7 @@ func (room *Room) HardLeave(reg *Registry, clientID string) {
 	}
 	delete(room.clients, clientID)
 	delete(room.health, clientID)
+	room.removeStreamPeer(clientID)
 	if p := room.pending[clientID]; p != nil {
 		if p.timer != nil {
 			p.timer.Stop()
@@ -341,6 +357,7 @@ func (room *Room) finalizeLeave(reg *Registry, clientID string) {
 	delete(room.pending, clientID)
 	delete(room.tokens, p.token)
 	delete(room.health, clientID)
+	room.removeStreamPeer(clientID)
 	room.promoteIfHostGone(clientID)
 	room.scheduleEmptyTimerLocked(reg, len(room.clients) == 0)
 	room.mu.Unlock()
@@ -397,9 +414,19 @@ func (room *Room) SetSettings(s protocol.RoomSettings) {
 	if s.MemLimitMB > protocol.MemLimitMaxMB {
 		s.MemLimitMB = protocol.MemLimitMaxMB
 	}
+	if s.StreamBitrateKbps < protocol.StreamBitrateMinKbps {
+		s.StreamBitrateKbps = protocol.StreamBitrateMinKbps
+	}
+	if s.StreamBitrateKbps > protocol.StreamBitrateMaxKbps {
+		s.StreamBitrateKbps = protocol.StreamBitrateMaxKbps
+	}
 	room.mu.Lock()
 	room.settings = s
+	bc := room.broadcaster
 	room.mu.Unlock()
+	if bc != nil {
+		bc.SetBitrate(s.StreamBitrateKbps)
+	}
 	room.broadcastState()
 	room.reconcileCache()
 }
@@ -450,6 +477,9 @@ func (room *Room) RemoveTrack(trackID string) {
 }
 
 func (room *Room) reconcileCache() {
+	if room.isStream() {
+		return
+	}
 	room.mu.Lock()
 	cm := room.cache
 	if cm == nil {
@@ -475,6 +505,10 @@ func (room *Room) AddTrack(t protocol.Track) {
 	room.queue = append(room.queue, t)
 	room.mu.Unlock()
 	room.broadcastState()
+	if room.isStream() {
+		room.streamMaybeStart()
+		return
+	}
 	room.maybeStart()
 	room.reconcileCache()
 }
@@ -494,6 +528,10 @@ func (room *Room) UpsertTrack(t protocol.Track) {
 	}
 	room.mu.Unlock()
 	room.broadcastState()
+	if room.isStream() {
+		room.streamMaybeStart()
+		return
+	}
 	room.maybeStart()
 	room.reconcileCache()
 }
@@ -508,6 +546,10 @@ func (room *Room) snapshot(selfID string) protocol.RoomStateData {
 	}
 	queue := make([]protocol.Track, len(room.queue))
 	copy(queue, room.queue)
+	playing := ""
+	if room.playing != nil {
+		playing = room.playing.trackID
+	}
 	data := protocol.RoomStateData{
 		RoomCode: room.Code,
 		Mode:     room.Mode,
@@ -516,6 +558,7 @@ func (room *Room) snapshot(selfID string) protocol.RoomStateData {
 		Settings: room.settings,
 		Members:  members,
 		Queue:    queue,
+		Playing:  playing,
 		UDPPort:  room.udpPort,
 	}
 	if c := room.clients[selfID]; c != nil {

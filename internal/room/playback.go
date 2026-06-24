@@ -191,6 +191,15 @@ func (room *Room) startPlayback(trackID string) {
 }
 
 func (room *Room) Pause() {
+	if room.isStream() {
+		room.mu.Lock()
+		bc := room.broadcaster
+		room.mu.Unlock()
+		if bc != nil {
+			bc.Pause()
+		}
+		return
+	}
 	room.mu.Lock()
 	pb := room.playing
 	if pb == nil || !pb.started || pb.paused {
@@ -208,6 +217,15 @@ func (room *Room) Pause() {
 }
 
 func (room *Room) Resume() {
+	if room.isStream() {
+		room.mu.Lock()
+		bc := room.broadcaster
+		room.mu.Unlock()
+		if bc != nil {
+			bc.Resume()
+		}
+		return
+	}
 	room.mu.Lock()
 	pb := room.playing
 	if pb == nil || !pb.started || !pb.paused {
@@ -224,6 +242,9 @@ func (room *Room) Resume() {
 }
 
 func (room *Room) SeekTo(ms int64) {
+	if room.isStream() {
+		return
+	}
 	room.mu.Lock()
 	pb := room.playing
 	if pb == nil || !pb.started {
@@ -247,6 +268,10 @@ func (room *Room) SeekTo(ms int64) {
 }
 
 func (room *Room) Skip() {
+	if room.isStream() {
+		room.streamSkip()
+		return
+	}
 	room.mu.Lock()
 	pb := room.playing
 	if pb == nil {
@@ -285,6 +310,9 @@ func (room *Room) endTrack(trackID string) {
 }
 
 func (room *Room) catchUp(c *Client) {
+	if room.isStream() {
+		return
+	}
 	room.mu.Lock()
 	pb := room.playing
 	if pb == nil {

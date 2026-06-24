@@ -35,6 +35,7 @@ const (
 	TypeProgress    = "progress"
 	TypeBye         = "bye"
 	TypePing        = "ping"
+	TypeRTC         = "rtc"
 )
 
 const (
@@ -91,23 +92,31 @@ const (
 	MemLimitDefaultMB = 50
 )
 
+const (
+	StreamBitrateMinKbps     = 16
+	StreamBitrateMaxKbps     = 256
+	StreamBitrateDefaultKbps = 64
+)
+
 type RoomSettings struct {
-	Enqueue    Policy   `json:"enqueue"`
-	Skip       Policy   `json:"skip"`
-	Remove     Policy   `json:"remove"`
-	Control    Policy   `json:"control"`
-	Sync       SyncMode `json:"sync"`
-	MemLimitMB int      `json:"memLimitMb"`
+	Enqueue           Policy   `json:"enqueue"`
+	Skip              Policy   `json:"skip"`
+	Remove            Policy   `json:"remove"`
+	Control           Policy   `json:"control"`
+	Sync              SyncMode `json:"sync"`
+	MemLimitMB        int      `json:"memLimitMb"`
+	StreamBitrateKbps int      `json:"streamBitrateKbps"`
 }
 
 func DefaultSettings() RoomSettings {
 	return RoomSettings{
-		Enqueue:    PolicyEveryone,
-		Skip:       PolicyEveryone,
-		Remove:     PolicyEveryone,
-		Control:    PolicyEveryone,
-		Sync:       SyncResponsive,
-		MemLimitMB: MemLimitDefaultMB,
+		Enqueue:           PolicyEveryone,
+		Skip:              PolicyEveryone,
+		Remove:            PolicyEveryone,
+		Control:           PolicyEveryone,
+		Sync:              SyncResponsive,
+		MemLimitMB:        MemLimitDefaultMB,
+		StreamBitrateKbps: StreamBitrateDefaultKbps,
 	}
 }
 
@@ -163,6 +172,19 @@ type PingData struct {
 	T0 int64 `json:"t0"`
 }
 
+const (
+	RTCJoin   = "join"
+	RTCOffer  = "offer"
+	RTCAnswer = "answer"
+	RTCICE    = "ice"
+)
+
+type RTCSignal struct {
+	Kind      string          `json:"kind"`
+	SDP       string          `json:"sdp,omitempty"`
+	Candidate json.RawMessage `json:"candidate,omitempty"`
+}
+
 type Health struct {
 	Confidence int   `json:"confidence"`
 	BufferedMs int64 `json:"bufferedMs"`
@@ -184,6 +206,7 @@ type RoomStateData struct {
 	Settings    RoomSettings `json:"settings"`
 	Members     []Member     `json:"members"`
 	Queue       []Track      `json:"queue"`
+	Playing     string       `json:"playingTrackId,omitempty"`
 	UDPPort     int          `json:"udpPort,omitempty"`
 	ResumeToken string       `json:"resumeToken,omitempty"`
 }

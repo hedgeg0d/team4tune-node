@@ -24,6 +24,7 @@ This document is the source of truth shared by `team4tune-node-server` and
 | `progress` | `{ trackId, haveMs, totalMs, bps, ready, confidence }` | Download/playback telemetry (~1/s). Drives adaptive start + member health. |
 | `bye` | `{}` | Intentional leave: immediate departure (no resume grace, frees host now). |
 | `ping` | `{ t0 }` | Clock sync. `t0` = client send time (unix ms). Also sent over UDP. |
+| `rtc` | `{ kind, sdp?, candidate? }` | **Stream mode** WebRTC signaling with the server. `kind`: `join` (request the broadcast) \| `answer` (sdp) \| `ice` (candidate). |
 
 ## Server → client
 
@@ -33,15 +34,18 @@ This document is the source of truth shared by `team4tune-node-server` and
 | `now_playing` | `{ trackId, t0, s, paused }` | Scheduled playback command; may be **unicast** to resync a late/returning client. |
 | `prepare` | `{ trackId, fileUrl, durationMs, title }` | Signal mode: download this file. |
 | `pong` | `{ t0, t1, t2 }` | Clock sync reply (WS or UDP). |
+| `rtc` | `{ kind, sdp?, candidate? }` | **Stream mode** signaling. `kind`: `offer` (sdp) \| `ice` (candidate). The server is the single WebRTC peer; it offers, the client answers. |
 | `error` | `{ code, message }` | `code: "forbidden"` when a gated action is denied. |
 
 ## Permissions & host
 
-`settings` is `{ enqueue, skip, remove, control, sync, memLimitMb }`. The four scopes are
-each a **policy** of `"everyone"` or `"host"` (default `everyone`). `sync` is the start
-policy (below). `memLimitMb` (2–100, default 50) is the room's media cache budget: the
-server keeps as many upcoming tracks fully downloaded (best seeking) as fit the budget and
-streams the rest on demand as HLS, evicting tracks that leave the queue.
+`settings` is `{ enqueue, skip, remove, control, sync, memLimitMb, streamBitrateKbps }`.
+The four scopes are each a **policy** of `"everyone"` or `"host"` (default `everyone`).
+`sync` is the start policy (below). `memLimitMb` (2–100, default 50) is the room's media
+cache budget: the server keeps as many upcoming tracks fully downloaded (best seeking) as
+fit the budget and streams the rest on demand as HLS, evicting tracks that leave the queue.
+`streamBitrateKbps` (16–256, default 64) is the Opus encode bitrate for **stream mode**
+(below); a change applies to the next track started.
 
 The **host** is the room creator, identified by an ephemeral session id (`hostId`); no
 accounts, no credential. On disconnect the host slot is held for a resume grace window
@@ -93,6 +97,27 @@ Control actions are server-authoritative: a client sends `control`, the server m
 the single source of truth and broadcasts a fresh `now_playing` to everyone, so the room
 stays in lockstep. `pause` freezes `s` at the current position; `resume` sets a new
 future `t0`; `seek` sets `s` (and a new `t0` unless paused).
+
+## Stream mode (server-broadcast over WebRTC)
+
+A room created with `mode: "stream"` replaces signal mode's download-and-clock-sync with
+a **live broadcast**: the server is a single WebRTC peer that decodes the current queue
+track to Opus (at `streamBitrateKbps`) and streams it to every client. The host still
+drives the queue (`enqueue`/`skip`); the server plays one track at a time and advances to
+the next on track end. There is no `prepare`/`now_playing`/`ready`/clock-sync on this path
+— WebRTC's jitter buffer handles timing.
+
+Signaling (all over the WebSocket, client ↔ server only):
+
+1. On entering a stream room the client sends `rtc{ kind: "join" }`.
+2. The server creates a `PeerConnection`, adds the shared Opus track, and sends
+   `rtc{ kind: "offer", sdp }`.
+3. The client answers `rtc{ kind: "answer", sdp }`.
+4. Both trickle ICE via `rtc{ kind: "ice", candidate }`.
+
+Once connected the client just plays the incoming audio. `skip` cancels the current track
+and advances; `control{ pause|resume }` pauses/resumes the broadcast. `seek` is not yet
+supported in stream mode. A `streamBitrateKbps` change applies to the next track started.
 
 ## HTTP endpoints
 

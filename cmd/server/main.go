@@ -37,6 +37,7 @@ func main() {
 	reg := room.NewRegistry()
 	reg.SetTrackCleaner(func(id string) { _ = pipeline.Delete(id) })
 	reg.SetCacheManager(pipeline)
+	reg.SetStreamResolver(pipeline)
 
 	if udp, err := udpclock.Listen(udpAddr); err != nil {
 		log.Printf("udp clock disabled: %v", err)

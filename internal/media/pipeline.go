@@ -206,6 +206,21 @@ func (p *Pipeline) Resolve(sourceURL string, onUpdate func(protocol.Track)) prot
 	return snap
 }
 
+func (p *Pipeline) StreamInput(t protocol.Track) (string, bool) {
+	opus := filepath.Join(p.cacheDir, t.ID+".opus")
+	if _, err := os.Stat(opus); err == nil {
+		return opus, true
+	}
+	if strings.HasPrefix(t.SourceURL, uploadPrefix) {
+		return "", false
+	}
+	direct := p.directURLFor(t.ID, t.SourceURL)
+	if direct == "" {
+		return "", false
+	}
+	return direct, true
+}
+
 func (p *Pipeline) Get(id string) (protocol.Track, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()

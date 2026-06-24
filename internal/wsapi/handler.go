@@ -216,6 +216,16 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				current = nil
 			}
 
+		case protocol.TypeRTC:
+			if current == nil {
+				continue
+			}
+			var d protocol.RTCSignal
+			if err := json.Unmarshal(env.Data, &d); err != nil {
+				continue
+			}
+			current.HandleRTC(client.ID, d)
+
 		case protocol.TypePing:
 			t1 := time.Now().UnixMilli()
 			var d protocol.PingData
