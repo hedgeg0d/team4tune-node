@@ -1,13 +1,10 @@
 # team4tune wire protocol
 
-Transport: WebSocket at `/ws`. Every message is a JSON envelope:
+WebSocket at `/ws`. Every message is a JSON envelope:
 
 ```json
 { "type": "<name>", "data": { ... } }
 ```
-
-This document is the source of truth shared by `team4tune-node-server` and
-`team4tune-client`. Keep both sides in sync.
 
 ## Client → server
 
@@ -19,61 +16,54 @@ This document is the source of truth shared by `team4tune-node-server` and
 | `skip` | `{}` | Skip the current track. Gated by `skip` policy. |
 | `remove` | `{ trackId }` | Remove a queued track (not the current one). Gated by `remove` policy. |
 | `control` | `{ action, seekMs? }` | `action`: `pause` \| `resume` \| `seek` (`seekMs` for seek). Gated by `control` policy. |
-| `set_settings` | `{ enqueue, skip, remove, control, sync, memLimitMb }` | Replace room settings. **Host only.** |
+| `set_settings` | `{ enqueue, skip, remove, control, sync, memLimitMb }` | Replace room settings. Host only. |
 | `ready` | `{ trackId }` | Signal mode: this client can start (buffer lead reached / downloaded). |
 | `progress` | `{ trackId, haveMs, totalMs, bps, ready, confidence }` | Download/playback telemetry (~1/s). Drives adaptive start + member health. |
 | `bye` | `{}` | Intentional leave: immediate departure (no resume grace, frees host now). |
 | `ping` | `{ t0 }` | Clock sync. `t0` = client send time (unix ms). Also sent over UDP. |
-| `rtc` | `{ kind, sdp?, candidate? }` | **Stream mode** WebRTC signaling with the server. `kind`: `join` (request the broadcast) \| `answer` (sdp) \| `ice` (candidate). |
+| `rtc` | `{ kind, sdp?, candidate? }` | WebRTC signaling for stream mode. `kind`: `join` (request broadcast) \| `answer` (sdp) \| `ice` (candidate). |
 
 ## Server → client
 
 | type | data | notes |
 |------|------|-------|
 | `room_state` | `{ roomCode, mode, selfId, hostId, settings, members[], queue[], udpPort, resumeToken }` | Full snapshot. `members[i].health = { confidence, bufferedMs, bps, ready }`. `resumeToken` is self-only. |
-| `now_playing` | `{ trackId, t0, s, paused }` | Scheduled playback command; may be **unicast** to resync a late/returning client. |
+| `now_playing` | `{ trackId, t0, s, paused }` | Scheduled playback command. May be unicast to resync a late/returning client. |
 | `prepare` | `{ trackId, fileUrl, durationMs, title }` | Signal mode: download this file. |
 | `pong` | `{ t0, t1, t2 }` | Clock sync reply (WS or UDP). |
-| `rtc` | `{ kind, sdp?, candidate? }` | **Stream mode** signaling. `kind`: `offer` (sdp) \| `ice` (candidate). The server is the single WebRTC peer; it offers, the client answers. |
+| `rtc` | `{ kind, sdp?, candidate? }` | Stream mode signaling. `kind`: `offer` (sdp) \| `ice` (candidate). The server is the single WebRTC peer — it offers, the client answers. |
 | `error` | `{ code, message }` | `code: "forbidden"` when a gated action is denied. |
 
 ## Permissions & host
 
 `settings` is `{ enqueue, skip, remove, control, sync, memLimitMb, streamBitrateKbps }`.
-The four scopes are each a **policy** of `"everyone"` or `"host"` (default `everyone`).
-`sync` is the start policy (below). `memLimitMb` (2–100, default 50) is the room's media
-cache budget: the server keeps as many upcoming tracks fully downloaded (best seeking) as
-fit the budget and streams the rest on demand as HLS, evicting tracks that leave the queue.
-`streamBitrateKbps` (16–256, default 64) is the Opus encode bitrate for **stream mode**
-(below); a change applies to the next track started.
+The four scopes each have a policy of `"everyone"` or `"host"` (default `everyone`).
+`sync` is the start policy. `memLimitMb` (2–100, default 50) controls the room's media
+cache budget. `streamBitrateKbps` (16–256, default 64) is the Opus encode bitrate for
+stream mode; changes apply to the next track started.
 
-The **host** is the room creator, identified by an ephemeral session id (`hostId`); no
-accounts, no credential. On disconnect the host slot is held for a resume grace window
-(~60 s); if it expires the **oldest remaining** member becomes host. The client is host
-when `selfId == hostId`. A gated action from a non-permitted client returns
-`error{ code: "forbidden" }` and changes nothing.
+The host is the room creator (ephemeral session id, no accounts). On disconnect the
+host slot is held for ~60 s resume grace; if it expires the oldest remaining member
+becomes host. Gated actions from non-permitted clients return `error{ code: "forbidden" }`.
 
-## Adaptive start, telemetry & resync
+## Adaptive start & telemetry
 
-Clients stream `progress` while downloading and playing. The server starts a track when
+Clients send `progress` while downloading/playing. The server starts a track when
 ready clients meet the deadline for the room's `sync` mode — `responsive` (short cap,
-default) or `tight` (long cap) — so one slow peer never blocks the room. A client that
-becomes ready **after** start (slow download, late joiner, or reconnect) is sent a unicast
-`now_playing` at the live position to catch up. Per-member `health.confidence` (0–3) is
-surfaced to everyone so the room can see who is struggling.
+default) or `tight` (long cap) — so one slow peer never blocks the room. Late clients
+get a unicast `now_playing` at the live position. Per-member `health.confidence` (0–3)
+is visible to everyone.
 
 ## Reconnect & resume
 
-Each member receives a self-only `resumeToken` in `room_state`. On an unexpected socket
-drop the server keeps the slot (and host role) for ~60 s; the client auto-reconnects and
-`join`s with the token to reattach the same identity, seq, and host role, then resyncs via
-`now_playing`. An explicit `bye` skips the grace window. Tokens are random, in-memory, and
-expire — anonymity is preserved.
+Each member gets a self-only `resumeToken` in `room_state`. On an unexpected socket
+drop the server keeps the slot (and host role) for ~60 s. The client reconnects and
+`join`s with the token to reattach the same identity, then resyncs via `now_playing`.
+An explicit `bye` skips the grace window. Tokens are random, in-memory, and expire.
 
 ## Clock sync (NTP-style)
 
-1. Client sends `ping{ t0 }` (over a dedicated **UDP** endpoint when available — its port
-   is advertised as `udpPort` in `room_state` — otherwise over the WebSocket).
+1. Client sends `ping{ t0 }` over UDP (port from `room_state.udpPort`) or WebSocket.
 2. Server replies `pong{ t0, t1, t2 }` where `t1` = server receive, `t2` = server send.
 3. Client records `t3` = receive time, then:
 
@@ -82,57 +72,49 @@ offset = ((t1 - t0) + (t2 - t3)) / 2
 rtt    = (t3 - t0) - (t2 - t1)
 ```
 
-The client bursts pings on join for fast convergence, rejects high-RTT outliers, and fits
-a line `offset(t) = a + b·t` over low-RTT samples to track clock **skew**, not just a fixed
-offset. UDP avoids TCP head-of-line jitter; the client falls back to WS if UDP is blocked.
-Server clock is the single source of truth for scheduled playback.
+The client bursts pings on join for fast convergence, rejects high-RTT outliers, and
+fits `offset(t) = a + b·t` over low-RTT samples to track clock skew. UDP avoids TCP
+head-of-line jitter; the client falls back to WS if UDP is blocked. Server clock is
+the reference for scheduled playback.
 
 ## Scheduled playback (M3)
 
 Server holds `{ trackId, t0 (serverTime), s (seekMs), paused }`.
-Playback position at server time `t`: `pos = s + (t - t0)` while playing, or `s` while
+Playback position at server time `t`: `pos = s + (t - t0)` while playing, `s` while
 paused. Client converts to local clock: `localStart = t0 - offset`.
 
 Control actions are server-authoritative: a client sends `control`, the server mutates
-the single source of truth and broadcasts a fresh `now_playing` to everyone, so the room
-stays in lockstep. `pause` freezes `s` at the current position; `resume` sets a new
-future `t0`; `seek` sets `s` (and a new `t0` unless paused).
+the state and broadcasts a fresh `now_playing` to everyone. `pause` freezes `s` at the
+current position; `resume` sets a new future `t0`; `seek` sets `s` (and a new `t0`
+unless paused).
 
-## Stream mode (server-broadcast over WebRTC)
+## Stream mode (WebRTC broadcast)
 
-A room created with `mode: "stream"` replaces signal mode's download-and-clock-sync with
-a **live broadcast**: the server is a single WebRTC peer that decodes the current queue
-track to Opus (at `streamBitrateKbps`) and streams it to every client. The host still
-drives the queue (`enqueue`/`skip`); the server plays one track at a time and advances to
-the next on track end. There is no `prepare`/`now_playing`/`ready`/clock-sync on this path
-— WebRTC's jitter buffer handles timing.
+A room with `mode: "stream"` replaces download-and-clock-sync with a live broadcast:
+the server decodes the current track to Opus (at `streamBitrateKbps`) and streams it
+to every client via a single WebRTC `PeerConnection`. The host drives the queue;
+the server plays one track at a time and advances on track end. No
+`prepare`/`now_playing`/`ready`/clock-sync — WebRTC's jitter buffer handles timing.
 
-Signaling (all over the WebSocket, client ↔ server only):
+Signaling flow (over WebSocket):
 
-1. On entering a stream room the client sends `rtc{ kind: "join" }`.
-2. The server creates a `PeerConnection`, adds the shared Opus track, and sends
-   `rtc{ kind: "offer", sdp }`.
-3. The client answers `rtc{ kind: "answer", sdp }`.
+1. Client sends `rtc{ kind: "join" }` on entering a stream room.
+2. Server creates a `PeerConnection`, adds the Opus track, sends `rtc{ kind: "offer", sdp }`.
+3. Client answers `rtc{ kind: "answer", sdp }`.
 4. Both trickle ICE via `rtc{ kind: "ice", candidate }`.
 
-Once connected the client just plays the incoming audio. `skip` cancels the current track
-and advances; `control{ pause|resume }` pauses/resumes the broadcast. `seek` is not yet
-supported in stream mode. A `streamBitrateKbps` change applies to the next track started.
+Once connected the client plays incoming audio. `skip` cancels the current track and
+advances. `control{ pause|resume }` pauses/resumes the broadcast. `seek` is not yet
+supported in stream mode.
 
 ## HTTP endpoints
 
-Alongside the WebSocket, the server exposes plain HTTP:
-
-- `GET /media/<id>.opus` — serves a complete or in-progress Ogg/Opus track. Complete files support Range (`206`).
-- `GET /media/<id>/index.m3u8` — HLS playlist for long remote tracks. Segment URIs are relative to the playlist.
-- `GET /media/<id>/seg/<n>.ts` — lazily generated MPEG-TS/AAC HLS segment for absolute segment index `n`.
-- `POST /upload` — `multipart/form-data` with field `file` (an **Ogg/Opus** file) and
-  optional `title`. The client encodes the Opus locally (no server transcode); the server
-  stores it under a content hash, verifies the codec is Opus, probes duration, and returns
-  `{ sourceUrl: "upload://<id>", title, durationMs }`. The client then sends a normal
-  `enqueue` with that `sourceUrl`. Errors: `415` non-Opus, `413` too large (100 MB cap),
-  `400` missing file, `405` non-POST. The endpoint is room-agnostic; enqueue permission is
-  still enforced by the `enqueue` message.
+- `GET /media/<id>.opus` — Ogg/Opus track. Complete files support Range (`206`).
+- `GET /media/<id>/index.m3u8` — HLS playlist for long remote tracks.
+- `GET /media/<id>/seg/<n>.ts` — lazily generated MPEG-TS/AAC segment for index `n`.
+- `POST /upload` — `multipart/form-data` with field `file` (Ogg/Opus) and optional
+  `title`. Returns `{ sourceUrl: "upload://<id>", title, durationMs }`.
+  Errors: `415` non-Opus, `413` too large (100 MB cap), `400` missing file, `405` non-POST.
 
 ## Anonymity
 
