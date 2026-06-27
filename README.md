@@ -20,6 +20,11 @@ go test ./...
 
 Network e2e test (requires yt-dlp): `TEAM4TUNE_E2E=1 go test ./internal/wsapi/ -run EndToEnd`.
 
+## Modes
+
+- **signal** — server sends control signals and serves the media file; each client downloads and plays locally, synced to a shared wall clock (tight sync, <50 ms target).
+- **stream** — server decodes the current track to Opus via WebRTC and broadcasts live to all clients. WebRTC's jitter buffer handles timing; no clock sync needed.
+
 ## Configuration
 
 | Env | Default | Description |
